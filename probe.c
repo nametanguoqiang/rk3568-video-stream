@@ -97,12 +97,22 @@ int main(int argc, char **argv)
         fs.pixel_format = fmt.pixelformat;      // 查这个格式支持哪些分辨率
 
         for (fs.index = 0; ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &fs) == 0; fs.index++) {
-            if (fs.type == V4L2_FRMSIZE_TYPE_DISCRETE)
-                printf("        %ux%u\n", fs.discrete.width, fs.discrete.height);
-            else                                // STEPWISE：范围内任意分辨率
-                printf("        %ux%u ~ %ux%u\n",
-                       fs.stepwise.min_width, fs.stepwise.min_height,
-                       fs.stepwise.max_width, fs.stepwise.max_height);
+            if (fs.type != V4L2_FRMSIZE_TYPE_DISCRETE)
+                continue;                       // 步进型没法逐个查帧率，跳过
+
+            printf("        %ux%u\n", fs.discrete.width, fs.discrete.height);
+
+            // 查这个格式在这个分辨率下支持哪些帧率
+            struct v4l2_frmivalenum fiv;
+            memset(&fiv, 0, sizeof(fiv));
+            fiv.pixel_format = fmt.pixelformat;
+            fiv.width  = fs.discrete.width;
+            fiv.height = fs.discrete.height;
+
+            for (fiv.index = 0; ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &fiv) == 0; fiv.index++) {
+                if (fiv.type == V4L2_FRMIVAL_TYPE_DISCRETE)
+                    printf("            %u fps\n", fiv.discrete.denominator);
+            }
         }
     }
 

@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/mman.h>
@@ -48,6 +49,16 @@ static int xioctl(int fd, unsigned long request, void *arg)
 static unsigned int fourcc_code(const char *s)
 {
     return v4l2_fourcc(s[0], s[1], s[2], s[3]);
+}
+
+// 取当前时间，单位秒带小数。MONOTONIC 单调递增，不会被校时跳变影响
+static double now_sec(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);        // 从系统启动开始算，只会往前走
+
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;  // 纳秒除 10^9 换成秒
 }
 
 int main(int argc, char **argv)
@@ -146,6 +157,32 @@ int main(int argc, char **argv)
            fmt.fmt.pix.bytesperline,
            fmt.fmt.pix.sizeimage);
 
+
+    // 不设的话驱动用默认帧率，C270 默认给 15fps
+    struct v4l2_streamparm parm;
+    memset(&parm, 0, sizeof(parm));
+    parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    parm.parm.capture.timeperframe.numerator   = 1;   // 分子 1
+    parm.parm.capture.timeperframe.denominator = 30;  // 分母 30，就是 1/30 秒一帧
+
+    if (xioctl(fd, VIDIOC_S_PARM, &parm) < 0) {
+        perror("VIDIOC_S_PARM");
+    } else {
+        // S_PARM 也是商量，必须读回来确认驱动真给了 30
+        printf("[3.5] 帧率: %u/%u\n",
+               parm.parm.capture.timeperframe.numerator,
+               parm.parm.capture.timeperframe.denominator);
+    }
+
+    // S_PARM 回填的值不可信，用 G_PARM 读驱动实际记的是多少
+    memset(&parm, 0, sizeof(parm));
+    parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (xioctl(fd, VIDIOC_G_PARM, &parm) == 0) {
+        printf("[3.6] 设完读回: %u/%u\n",
+               parm.parm.capture.timeperframe.numerator,
+               parm.parm.capture.timeperframe.denominator);
+    }
+
     // ---------- [4] 申请缓冲并映射 ----------
 
     struct v4l2_requestbuffers req;
@@ -221,7 +258,24 @@ int main(int argc, char **argv)
     }
     printf("[5] 已开流，驱动开始采集\n");
 
+    // 开流之后再读一次，看 UVC 带宽协商有没有偷偷改帧率
+    memset(&parm, 0, sizeof(parm));
+    parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (xioctl(fd, VIDIOC_G_PARM, &parm) == 0) {
+        printf("[5.5] 开流后帧率: %u/%u\n",
+               parm.parm.capture.timeperframe.numerator,
+               parm.parm.capture.timeperframe.denominator);
+    }
+
     // ---------- [6] 循环取帧 ----------
+
+    double t_start = 0.0;                       // 第一帧时间，计时起点
+    double t_prev  = 0.0;                       // 上一帧时间，算间隔用
+    double gap_max = 0.0;                       // 最大间隔，看有没有卡顿
+    double gap_min = 1e9;                       // 最小间隔，初值给大才能被覆盖
+    double gap_sum = 0.0;                       // 间隔累加，除以个数得平均
+    int    gap_cnt = 0;                         // 间隔个数，比帧数少 1
+    int    got     = 0;                         // 实际采到的帧数，break 后也准
 
     for (int n = 0; n < want_frames; n++) {
 
@@ -230,10 +284,10 @@ int main(int argc, char **argv)
         FD_SET(fd, &fds);
 
         struct timeval tv;
-        tv.tv_sec  = 5;                             // 2 秒不够，摄像头要初始化自动曝光
+        tv.tv_sec  = 5;                         // 2 秒不够，摄像头要初始化自动曝光
         tv.tv_usec = 0;
 
-        // 非阻塞模式下 DQBUF 没数据会立即返回 EAGAIN，用 select 睡着等更省 CPU
+        // 非阻塞下 DQBUF 没数据会立即返回 EAGAIN，select 睡着等更省 CPU
         int r = select(fd + 1, &fds, NULL, NULL, &tv);
 
         if (r < 0) {
@@ -255,36 +309,80 @@ int main(int argc, char **argv)
             break;
         }
 
-        // bytesused 是这一帧的有效字节数，比缓冲总长度小得多
-        printf("[6] 取到第 %d 帧: 缓冲 %u, 有效字节 %u\n",
-               n, buf.index, buf.bytesused);
+        // 时间戳必须记在 DQBUF 之后、存盘之前，记晚了会混进写盘时间
+        double t_now = now_sec();
 
-        char path[256];
-        const char *ext = (pixfmt == v4l2_fourcc('M','J','P','G')) ? "jpg" : "raw";
-
-        snprintf(path, sizeof(path), "%s_%d.%s", prefix, n, ext);
-
-        FILE *fp = fopen(path, "wb");               // wb：二进制写，不转换行尾
-        if (fp == NULL) {
-            perror("fopen");
+        if (n == 0) {
+            t_start = t_now;                    // 第一帧只记起点，没有间隔
         } else {
-            size_t written = fwrite(buffers[buf.index].start, 1, buf.bytesused, fp);
-            fclose(fp);
+            double gap = t_now - t_prev;
 
-            if (written != buf.bytesused) {         // 写少了说明磁盘满
-                fprintf(stderr, "警告: 只写入 %zu 字节，预期 %u 字节\n", written, buf.bytesused);
+            if (gap > gap_max) gap_max = gap;
+            if (gap < gap_min) gap_min = gap;
+            gap_sum += gap;
+            gap_cnt++;
+        }
+
+        t_prev = t_now;
+        got++;
+
+        // 300 帧全打会刷屏，只打前 3 帧和最后 1 帧
+        if (n < 3 || n == want_frames - 1)
+            printf("[6] 取到第 %d 帧: 缓冲 %u, 有效字节 %u\n",
+                   n, buf.index, buf.bytesused);
+        else if (n == 3)
+            printf("    ... 中间省略 ...\n");
+
+        // 只存第一帧：测帧率时每帧写盘会拖慢采集，测出来的是磁盘性能
+        if (n == 0) {
+            char path[256];
+            const char *ext = (pixfmt == v4l2_fourcc('M','J','P','G')) ? "jpg" : "raw";
+
+            snprintf(path, sizeof(path), "%s_%d.%s", prefix, n, ext);
+
+            FILE *fp = fopen(path, "wb");
+            if (fp == NULL) {
+                perror("fopen");
             } else {
-                printf("    已保存 %s (%u 字节)\n", path, buf.bytesused);
+                size_t written = fwrite(buffers[buf.index].start, 1, buf.bytesused, fp);
+                fclose(fp);
+
+                if (written != buf.bytesused)
+                    fprintf(stderr, "警告: 只写入 %zu 字节，预期 %u 字节\n",
+                            written, buf.bytesused);
+                else
+                    printf("    已保存 %s (%u 字节)\n", path, buf.bytesused);
             }
         }
 
-        // 用完必须还回去，不还的话缓冲用一块少一块，第 4 帧之后就取不到数据
+        // 用完必须还回去，不还的话缓冲用一块少一块
         if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
             perror("VIDIOC_QBUF 归还");
             break;
         }
     }
 
+    // ========== [6.5] 打印帧率统计 ==========
+
+    if (got > 1) {                              // 1 帧没有间隔，会除零
+        double total = t_prev - t_start;
+
+        printf("\n===== 采集统计 =====\n");
+        printf("总帧数   : %d\n", got);
+        printf("总耗时   : %.3f 秒\n", total);
+
+        // 帧率 = 间隔数 / 总耗时，不是帧数 / 总耗时，否则会算高一点
+        printf("平均帧率 : %.1f fps\n", (double)(got - 1) / total);
+
+        printf("平均间隔 : %.1f ms\n", (gap_sum / gap_cnt) * 1000.0);
+        printf("最大间隔 : %.1f ms\n", gap_max * 1000.0);
+        printf("最小间隔 : %.1f ms\n", gap_min * 1000.0);
+        printf("====================\n");
+
+        // 30fps 平均间隔 33ms，超过 3 倍说明中间卡过
+        if (gap_max > (gap_sum / gap_cnt) * 3.0)
+            printf("警告: 最大间隔超过平均间隔 3 倍，说明中间有卡顿\n");
+    }
     // ---------- [7] 收尾清理 ----------
 
     xioctl(fd, VIDIOC_STREAMOFF, &type);
