@@ -26,7 +26,7 @@
 #include <linux/videodev2.h>
 #include <pthread.h>
 #include "ringbuf.h"
-
+#include "network.h"
 #define BUFFER_COUNT    4				// 4 块够周转，2 块容易等，再多浪费内存
 
 // ---------- 缓冲描述 ----------
@@ -59,7 +59,7 @@ static unsigned int fourcc_code(const char *s)
 static struct ringbuf g_ring;           // 全局环形缓冲，采集和消费共享
 static volatile int   g_stop = 0;       // 置 1 通知消费者退出
 
-// 消费者线程：故意睡 20ms，比采集慢，用来测丢帧
+// 消费者线程：把帧广播给所有客户端，没人看就直接丢
 static void *consumer(void *arg)
 {
 	(void)arg;
@@ -68,8 +68,8 @@ static void *consumer(void *arg)
 
 	while (ring_get(&g_ring, &f, &g_stop) == 0)
 	{
-		usleep(100000);		// 模拟慢速处理，100ms 一帧，比采集的 66ms 慢，队列才会堆
-		ring_free(&f);
+		net_broadcast(&f);                  // 写所有客户端，慢的话这里会堵
+		ring_free(&f);                      // 发完才还内存
 		consumed++;
 	}
 
@@ -306,6 +306,9 @@ int main(int argc, char **argv)
 	}
 	ring_init(&g_ring);
 
+	if (net_start(NET_PORT) < 0)            // 端口起不来就别往下走
+		return 1;
+
 	pthread_t tid;
 	if (pthread_create(&tid, NULL, consumer, NULL) != 0)
 	{
@@ -367,6 +370,8 @@ int main(int argc, char **argv)
 	g_stop = 1;
 	pthread_join(tid, NULL);
 
+	net_stop();                             // 断开客户端，关监听
+	
 	unsigned long put_cnt, drop_cnt;
 	ring_stats(&g_ring, &put_cnt, &drop_cnt);		// 两个数由函数写回
 
