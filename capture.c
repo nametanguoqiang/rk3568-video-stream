@@ -27,6 +27,7 @@
 #include <pthread.h>
 #include "ringbuf.h"
 #include "network.h"
+#include "preview.h"
 #define BUFFER_COUNT    4				// 4 块够周转，2 块容易等，再多浪费内存
 
 // ---------- 缓冲描述 ----------
@@ -56,17 +57,18 @@ static unsigned int fourcc_code(const char *s)
 {
 	return v4l2_fourcc(s[0], s[1], s[2], s[3]);
 }
-static struct ringbuf g_ring;           // 全局环形缓冲，采集和消费共享
+static struct ringbuf g_ring_net;       // 推流消费者的队列
+static struct ringbuf g_ring_prev;      // 本地预览消费者的队列
 static volatile int   g_stop = 0;       // 置 1 通知消费者退出
 
 // 消费者线程：把帧广播给所有客户端，没人看就直接丢
-static void *consumer(void *arg)
+static void *net_consumer(void *arg)
 {
 	(void)arg;
 	struct frame f;
 	unsigned long consumed = 0;
 
-	while (ring_get(&g_ring, &f, &g_stop) == 0)
+	while (ring_get(&g_ring_net, &f, &g_stop) == 0)
 	{
 		net_broadcast(&f);                  // 写所有客户端，慢的话这里会堵
 		ring_free(&f);                      // 发完才还内存
@@ -304,15 +306,25 @@ int main(int argc, char **argv)
 			   parm.parm.capture.timeperframe.numerator,
 			   parm.parm.capture.timeperframe.denominator);
 	}
-	ring_init(&g_ring);
+	ring_init(&g_ring_net);
+	ring_init(&g_ring_prev);
 
-	if (net_start(NET_PORT) < 0)            // 端口起不来就别往下走
+	// 预览线程的上下文：吃哪条队列、听谁的退出标志
+	static struct preview_ctx prev_ctx = { &g_ring_prev, &g_stop };
+
+	if (preview_init("/dev/fb0") < 0)               // 屏幕打不开就别往下走
 		return 1;
 
-	pthread_t tid;
-	if (pthread_create(&tid, NULL, consumer, NULL) != 0)
+	pthread_t tid_net, tid_prev;
+	if (pthread_create(&tid_net, NULL, net_consumer, NULL) != 0)
 	{
-		perror("pthread_create");
+		perror("pthread_create net");
+		return 1;
+	}
+
+	if (pthread_create(&tid_prev, NULL, preview_thread, &prev_ctx) != 0)
+	{
+		perror("pthread_create prev");
 		return 1;
 	}
 	// ---------- [6] 循环取帧 ----------
@@ -353,10 +365,10 @@ int main(int argc, char **argv)
 		}
 
 		// bytesused 是这一帧的有效字节数，比缓冲总长度小得多
-		// 拷进环形缓冲，采集线程只管放，不管谁消费
-		ring_put(&g_ring, buffers[buf.index].start, buf.bytesused);
-
-		printf("[6] 取到第 %d 帧, 入队 seq=%lu\n", n, g_ring.put_cnt - 1);
+		// 两路消费者各一条队列，复制两份，谁慢谁丢自己的
+		ring_put(&g_ring_net,  buffers[buf.index].start, buf.bytesused);
+		ring_put(&g_ring_prev, buffers[buf.index].start, buf.bytesused);
+		printf("[6] 取到第 %d 帧, 入队 seq=%lu\n", n, g_ring_net.put_cnt - 1);
 
 		// 用完必须还回去，不还的话缓冲用一块少一块，第 4 帧之后就取不到数据
 		if (xioctl(fd, VIDIOC_QBUF, &buf) < 0)
@@ -368,19 +380,23 @@ int main(int argc, char **argv)
 
 	// 通知消费者退出，等它把缓冲里的帧取完再往下走
 	g_stop = 1;
-	pthread_join(tid, NULL);
+	pthread_join(tid_net, NULL);
+	pthread_join(tid_prev, NULL);
 
-	net_stop();                             // 断开客户端，关监听
-	
-	unsigned long put_cnt, drop_cnt;
-	ring_stats(&g_ring, &put_cnt, &drop_cnt);		// 两个数由函数写回
+	net_stop();
+	preview_deinit();                       // 线程已经 join 完，这时候才敢解映射
+
+	unsigned long put_n, drop_n, put_p, drop_p;
+	ring_stats(&g_ring_net,  &put_n, &drop_n);
+	ring_stats(&g_ring_prev, &put_p, &drop_p);
 
 	printf("\n===== 环形缓冲统计 =====\n");
-	printf("生产 : %lu 帧\n", put_cnt);
-	printf("丢弃 : %lu 帧\n", drop_cnt);
+	printf("推流 : 生产 %lu 帧, 丢弃 %lu 帧\n", put_n, drop_n);
+	printf("预览 : 生产 %lu 帧, 丢弃 %lu 帧\n", put_p, drop_p);
 	printf("======================\n");
 
-	ring_destroy(&g_ring);
+	ring_destroy(&g_ring_net);
+	ring_destroy(&g_ring_prev);
 
 	// ---------- [7] 收尾清理 ----------
 
