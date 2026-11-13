@@ -28,6 +28,7 @@
 #include "ringbuf.h"
 #include "network.h"
 #include "preview.h"
+#include <time.h>                       // clock_gettime，算一秒窗口的帧率
 #define BUFFER_COUNT    4				// 4 块够周转，2 块容易等，再多浪费内存
 
 // ---------- 缓冲描述 ----------
@@ -70,6 +71,7 @@ static void *net_consumer(void *arg)
 
 	while (ring_get(&g_ring_net, &f, &g_stop) == 0)
 	{
+		net_keep_frame(&f);                 // 留一份最新帧，/capture 要用
 		net_broadcast(&f);                  // 写所有客户端，慢的话这里会堵
 		ring_free(&f);                      // 发完才还内存
 		consumed++;
@@ -309,6 +311,9 @@ int main(int argc, char **argv)
 	ring_init(&g_ring_net);
 	ring_init(&g_ring_prev);
 
+	if (net_start(NET_PORT) < 0)                    // 端口起不来就别往下走
+		return 1;
+
 	// 预览线程的上下文：吃哪条队列、听谁的退出标志
 	static struct preview_ctx prev_ctx = { &g_ring_prev, &g_stop };
 
@@ -328,6 +333,13 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	// ---------- [6] 循环取帧 ----------
+
+
+	// 一秒窗口算平均帧率，比「两帧间隔取倒数」稳，不会跳来跳去
+	struct timespec win_start, win_now;
+	clock_gettime(CLOCK_MONOTONIC, &win_start);
+	unsigned long win_frames = 0;
+	double fps_now = 0.0;
 
 	for (int n = 0; n < want_frames; n++)
 	{
@@ -368,6 +380,25 @@ int main(int argc, char **argv)
 		// 两路消费者各一条队列，复制两份，谁慢谁丢自己的
 		ring_put(&g_ring_net,  buffers[buf.index].start, buf.bytesused);
 		ring_put(&g_ring_prev, buffers[buf.index].start, buf.bytesused);
+
+		win_frames++;
+		clock_gettime(CLOCK_MONOTONIC, &win_now);
+		double el = (win_now.tv_sec - win_start.tv_sec)
+			    + (win_now.tv_nsec - win_start.tv_nsec) / 1e9;
+
+		if (el >= 1.0)                      // 满一秒结算一次，重开窗口
+		{
+			fps_now = win_frames / el;
+
+			unsigned long pn, dn, pp, dp;
+			ring_stats(&g_ring_net,  &pn, &dn);
+			ring_stats(&g_ring_prev, &pp, &dp);
+			net_update_stats(fps_now, (unsigned long)(n + 1), dn, dp);
+
+			win_frames = 0;
+			win_start = win_now;
+		}
+
 		printf("[6] 取到第 %d 帧, 入队 seq=%lu\n", n, g_ring_net.put_cnt - 1);
 
 		// 用完必须还回去，不还的话缓冲用一块少一块，第 4 帧之后就取不到数据

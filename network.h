@@ -14,6 +14,11 @@
 
 int  net_start(int port);                   // 建监听并起 accept 线程
 void net_broadcast(const struct frame *f);  // 把一帧送给所有客户端
+
+void net_keep_frame(const struct frame *f);               // 留一份最新帧，给 /capture 用
+void net_update_stats(double fps, unsigned long frames,
+		      unsigned long drop_net, unsigned long drop_prev);
+
 void net_stop(void);                        // 关监听、断开所有客户端
 
 #endif
