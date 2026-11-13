@@ -55,6 +55,9 @@ static int send_all(int fd, const void *buf, size_t len)
 				continue;
 			return -1;
 		}
+		if (n == 0)                     // 极少数情况，对端关了但没报错
+			return -1;
+
 		sent += n;
 	}
 
@@ -194,6 +197,12 @@ static void *accept_thread(void *arg)
 		tv.tv_sec  = 2;
 		tv.tv_usec = 0;
 		setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+		// 发不出去最多等 1 秒，超时就认为这个客户端有问题，广播时会被踢掉
+		struct timeval sotv;
+		sotv.tv_sec  = 1;
+		sotv.tv_usec = 0;
+		setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sotv, sizeof(sotv));
 
 		char path[64];// 只要路径，不要参数，浏览器访问时会带 ?t=xxx
 		if (read_request(fd, path, sizeof(path)) < 0)

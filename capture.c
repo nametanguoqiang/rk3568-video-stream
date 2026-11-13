@@ -62,6 +62,13 @@ static struct ringbuf g_ring_net;       // 推流消费者的队列
 static struct ringbuf g_ring_prev;      // 本地预览消费者的队列
 static volatile int   g_stop = 0;       // 置 1 通知消费者退出
 
+// ---------- 采集设备状态，掉线重连时要整体重建 ----------
+static int                g_fd = -1;                                    // 设备描述符
+static struct buffer     *g_buffers = NULL;                             // mmap 出来的缓冲
+static unsigned int       g_nbuf = 0;                                   // 缓冲块数
+static enum v4l2_buf_type g_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;         // 采集类型
+
+
 // 消费者线程：把帧广播给所有客户端，没人看就直接丢
 static void *net_consumer(void *arg)
 {
@@ -79,6 +86,268 @@ static void *net_consumer(void *arg)
 
 	printf("\n消费者退出，共消费 %lu 帧\n", consumed);
 	return NULL;
+}
+
+// 停流、解映射、关设备，可以重复调用
+static void cam_close(void)
+{
+	if (g_fd < 0)
+		return;
+
+	xioctl(g_fd, VIDIOC_STREAMOFF, &g_type);
+
+	if (g_buffers != NULL)
+	{
+		for (unsigned int i = 0; i < g_nbuf; i++)
+		{
+			if (g_buffers[i].start != NULL && g_buffers[i].start != MAP_FAILED)
+				munmap(g_buffers[i].start, g_buffers[i].length);
+		}
+		free(g_buffers);
+		g_buffers = NULL;
+	}
+
+	g_nbuf = 0;
+	close(g_fd);
+	g_fd = -1;
+}
+
+// 打开设备、设格式、申请缓冲、映射、入队、开流。成功返回 0，失败返回 -1
+static int cam_open(const char *dev_name, unsigned int pixfmt,
+		    unsigned int want_w, unsigned int want_h)
+{
+	// ---------- [1] 打开设备 ----------
+
+	// O_NONBLOCK：某些驱动在 open 阶段会等硬件初始化，阻塞模式可能卡住
+	g_fd = open(dev_name, O_RDWR | O_NONBLOCK, 0);
+	if (g_fd < 0)
+	{
+		perror("open");
+		cam_close();
+		return -1;
+	}
+	printf("[1] 设备已打开: %s (fd=%d)\n", dev_name, g_fd);
+
+	// ---------- [2] 查询设备能力 ----------
+
+	struct v4l2_capability cap;
+	memset(&cap, 0, sizeof(cap));					// 不清零的话结构里有垃圾值
+
+	if (xioctl(g_fd, VIDIOC_QUERYCAP, &cap) < 0)
+	{
+		perror("VIDIOC_QUERYCAP");
+		cam_close();
+		return -1;
+	}
+
+	printf("[2] 驱动: %s\n", cap.driver);
+	printf("    卡名: %s\n", cap.card);
+	printf("    总线: %s\n", cap.bus_info);
+
+	// USB 摄像头会建两个节点，元数据节点没有采集能力，传错这里就拦住了
+	if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE))
+	{
+		fprintf(stderr, "错误: %s 不是视频采集节点\n", dev_name);
+		cam_close();
+		return -1;
+	}
+
+	// mmap 属于流式 IO，驱动不支持就没法零拷贝
+	if (!(cap.capabilities & V4L2_CAP_STREAMING))
+	{
+		fprintf(stderr, "错误: %s 不支持流式 IO，不能用 mmap\n", dev_name);
+		cam_close();
+		return -1;
+	}
+
+	// ---------- [3] 设置采集格式 ----------
+
+	struct v4l2_format fmt;
+	memset(&fmt, 0, sizeof(fmt));
+
+	fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;	// 单平面，USB 摄像头用这个
+	fmt.fmt.pix.width       = want_w;
+	fmt.fmt.pix.height      = want_h;
+	fmt.fmt.pix.pixelformat = pixfmt;
+	fmt.fmt.pix.field       = V4L2_FIELD_ANY;		// 扫描方式交给驱动决定
+
+	if (xioctl(g_fd, VIDIOC_S_FMT, &fmt) < 0)
+	{
+		perror("VIDIOC_S_FMT");
+		cam_close();
+		return -1;
+	}
+
+	// S_FMT 是商量不是命令，驱动可能改了分辨率但不报错，必须读回来确认
+	printf("[3] 实际格式: %c%c%c%c %ux%u, 每行字节 %u, 图像大小 %u\n",
+		   (fmt.fmt.pix.pixelformat      ) & 0xff,
+		   (fmt.fmt.pix.pixelformat >>  8) & 0xff,
+		   (fmt.fmt.pix.pixelformat >> 16) & 0xff,
+		   (fmt.fmt.pix.pixelformat >> 24) & 0xff,
+		   fmt.fmt.pix.width,
+		   fmt.fmt.pix.height,
+		   fmt.fmt.pix.bytesperline,
+		   fmt.fmt.pix.sizeimage);
+
+	// 不设的话驱动用默认帧率，这颗摄像头默认给 15fps
+	struct v4l2_streamparm parm;
+	memset(&parm, 0, sizeof(parm));
+	parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	parm.parm.capture.timeperframe.numerator   = 1;		// 分子 1
+	parm.parm.capture.timeperframe.denominator = 30;	// 分母 30，就是 1/30 秒一帧
+
+	if (xioctl(g_fd, VIDIOC_S_PARM, &parm) < 0)
+	{
+		perror("VIDIOC_S_PARM");
+	}
+	else
+	{
+		// S_PARM 也是商量，必须读回来确认驱动真给了 30
+		printf("[3.5] 帧率: %u/%u\n",
+			   parm.parm.capture.timeperframe.numerator,
+			   parm.parm.capture.timeperframe.denominator);
+	}
+
+	// S_PARM 回填的值不可信，用 G_PARM 读驱动实际记的是多少
+	memset(&parm, 0, sizeof(parm));
+	parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	if (xioctl(g_fd, VIDIOC_G_PARM, &parm) == 0)
+	{
+		printf("[3.6] 设完读回: %u/%u\n",
+			   parm.parm.capture.timeperframe.numerator,
+			   parm.parm.capture.timeperframe.denominator);
+	}
+
+	// ---------- [4] 申请缓冲并映射 ----------
+
+	struct v4l2_requestbuffers req;
+	memset(&req, 0, sizeof(req));
+
+	req.count  = BUFFER_COUNT;
+	req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	req.memory = V4L2_MEMORY_MMAP;					// mmap 方式，不是 read 拷贝
+
+	if (xioctl(g_fd, VIDIOC_REQBUFS, &req) < 0)
+	{
+		perror("VIDIOC_REQBUFS");
+		cam_close();
+		return -1;
+	}
+
+	printf("[4] 驱动实际分配 %u 块缓冲\n", req.count);	// 内存紧张时可能少给
+
+	if (req.count < 2)
+	{
+		fprintf(stderr, "错误: 缓冲数量不足，至少需要 2 块\n");
+		cam_close();
+		return -1;
+	}
+
+	g_buffers = calloc(req.count, sizeof(*g_buffers));
+	if (g_buffers == NULL)
+	{
+		perror("calloc");
+		cam_close();
+		return -1;
+	}
+
+	// 先记块数，后面映射中途失败时 cam_close 才知道要解几张
+	g_nbuf = req.count;
+
+	for (unsigned int i = 0; i < req.count; i++)
+	{
+		struct v4l2_buffer buf;
+		memset(&buf, 0, sizeof(buf));
+
+		buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		buf.memory = V4L2_MEMORY_MMAP;
+		buf.index  = i;								// 问第几块
+
+		if (xioctl(g_fd, VIDIOC_QUERYBUF, &buf) < 0)
+		{
+			perror("VIDIOC_QUERYBUF");
+			cam_close();
+			return -1;
+		}
+
+		g_buffers[i].length = buf.length;
+
+		// MAP_SHARED：和驱动共享同一块物理内存，驱动写进来我能看见
+		// buf.m.offset：这块缓冲在设备内存里的偏移，只有驱动知道
+		g_buffers[i].start = mmap(NULL, buf.length,
+								PROT_READ | PROT_WRITE,
+								MAP_SHARED, g_fd, buf.m.offset);
+
+		if (g_buffers[i].start == MAP_FAILED)
+		{
+			perror("mmap");
+			cam_close();
+			return -1;
+		}
+
+		// 空缓冲交给驱动，不入队的话 STREAMON 会因为没缓冲可用直接失败
+		if (xioctl(g_fd, VIDIOC_QBUF, &buf) < 0)
+		{
+			perror("VIDIOC_QBUF");
+			cam_close();
+			return -1;
+		}
+
+		printf("    缓冲 %u: 长度 %u 字节\n", i, buf.length);
+	}
+
+	g_nbuf = req.count;
+	printf("[4] %u 块缓冲已映射并入队\n", req.count);
+
+	// ---------- [5] 开流 ----------
+
+	g_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+	if (xioctl(g_fd, VIDIOC_STREAMON, &g_type) < 0)
+	{
+		perror("VIDIOC_STREAMON");
+		cam_close();
+		return -1;
+	}
+	printf("[5] 已开流，驱动开始采集\n");
+
+	// 开流之后再读一次，看 UVC 带宽协商有没有偷偷改帧率
+	memset(&parm, 0, sizeof(parm));
+	parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	if (xioctl(g_fd, VIDIOC_G_PARM, &parm) == 0)
+	{
+		printf("[5.5] 开流后帧率: %u/%u\n",
+			   parm.parm.capture.timeperframe.numerator,
+			   parm.parm.capture.timeperframe.denominator);
+	}
+
+	return 0;
+}
+
+// 掉线后重建：先全释放，每秒重试一次，最多半分钟
+static int cam_reopen(const char *dev_name, unsigned int pixfmt,
+		      unsigned int want_w, unsigned int want_h)
+{
+	printf("[CAM] 设备掉线，开始重连\n");
+
+	cam_close();
+
+	for (int k = 0; k < 30; k++)
+	{
+		sleep(1);
+
+		if (cam_open(dev_name, pixfmt, want_w, want_h) == 0)
+		{
+			printf("[CAM] 重连成功\n");
+			return 0;
+		}
+
+		printf("[CAM] 第 %d 次重连失败\n", k + 1);
+		cam_close();
+	}
+
+	printf("[CAM] 重连失败，放弃\n");
+	return -1;
 }
 
 // ---------- 主函数 ----------
@@ -120,194 +389,10 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	// ---------- [1] 打开设备 ----------
-
-	// O_NONBLOCK：某些驱动在 open 阶段会等硬件初始化，阻塞模式可能卡住
-	int fd = open(dev_name, O_RDWR | O_NONBLOCK, 0);
-	if (fd < 0)
-	{
-		perror("open");
+	// ---------- [1]-[5] 打开设备、设格式、申请缓冲、开流 ----------
+	if (cam_open(dev_name, pixfmt, want_w, want_h) < 0)
 		return 1;
-	}
-	printf("[1] 设备已打开: %s (fd=%d)\n", dev_name, fd);
 
-	// ---------- [2] 查询设备能力 ----------
-
-	struct v4l2_capability cap;
-	memset(&cap, 0, sizeof(cap));					// 不清零的话结构里有垃圾值
-
-	if (xioctl(fd, VIDIOC_QUERYCAP, &cap) < 0)
-	{
-		perror("VIDIOC_QUERYCAP");
-		return 1;
-	}
-
-	printf("[2] 驱动: %s\n", cap.driver);
-	printf("    卡名: %s\n", cap.card);
-	printf("    总线: %s\n", cap.bus_info);
-
-	// USB 摄像头会建两个节点，元数据节点没有采集能力，传错这里就拦住了
-	if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE))
-	{
-		fprintf(stderr, "错误: %s 不是视频采集节点\n", dev_name);
-		return 1;
-	}
-
-	// mmap 属于流式 IO，驱动不支持就没法零拷贝
-	if (!(cap.capabilities & V4L2_CAP_STREAMING))
-	{
-		fprintf(stderr, "错误: %s 不支持流式 IO，不能用 mmap\n", dev_name);
-		return 1;
-	}
-
-	// ---------- [3] 设置采集格式 ----------
-
-	struct v4l2_format fmt;
-	memset(&fmt, 0, sizeof(fmt));
-
-	fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;	// 单平面，USB 摄像头用这个
-	fmt.fmt.pix.width       = want_w;
-	fmt.fmt.pix.height      = want_h;
-	fmt.fmt.pix.pixelformat = pixfmt;
-	fmt.fmt.pix.field       = V4L2_FIELD_ANY;		// 扫描方式交给驱动决定
-
-	if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0)
-	{
-		perror("VIDIOC_S_FMT");
-		return 1;
-	}
-
-	// S_FMT 是商量不是命令，驱动可能改了分辨率但不报错，必须读回来确认
-	printf("[3] 实际格式: %c%c%c%c %ux%u, 每行字节 %u, 图像大小 %u\n",
-		   (fmt.fmt.pix.pixelformat      ) & 0xff,
-		   (fmt.fmt.pix.pixelformat >>  8) & 0xff,
-		   (fmt.fmt.pix.pixelformat >> 16) & 0xff,
-		   (fmt.fmt.pix.pixelformat >> 24) & 0xff,
-		   fmt.fmt.pix.width,
-		   fmt.fmt.pix.height,
-		   fmt.fmt.pix.bytesperline,
-		   fmt.fmt.pix.sizeimage);
-
-	// 不设的话驱动用默认帧率，这颗摄像头默认给 15fps
-	struct v4l2_streamparm parm;
-	memset(&parm, 0, sizeof(parm));
-	parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	parm.parm.capture.timeperframe.numerator   = 1;		// 分子 1
-	parm.parm.capture.timeperframe.denominator = 30;	// 分母 30，就是 1/30 秒一帧
-
-	if (xioctl(fd, VIDIOC_S_PARM, &parm) < 0)
-	{
-		perror("VIDIOC_S_PARM");
-	}
-	else
-	{
-		// S_PARM 也是商量，必须读回来确认驱动真给了 30
-		printf("[3.5] 帧率: %u/%u\n",
-			   parm.parm.capture.timeperframe.numerator,
-			   parm.parm.capture.timeperframe.denominator);
-	}
-
-	// S_PARM 回填的值不可信，用 G_PARM 读驱动实际记的是多少
-	memset(&parm, 0, sizeof(parm));
-	parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	if (xioctl(fd, VIDIOC_G_PARM, &parm) == 0)
-	{
-		printf("[3.6] 设完读回: %u/%u\n",
-			   parm.parm.capture.timeperframe.numerator,
-			   parm.parm.capture.timeperframe.denominator);
-	}
-
-	// ---------- [4] 申请缓冲并映射 ----------
-
-	struct v4l2_requestbuffers req;
-	memset(&req, 0, sizeof(req));
-
-	req.count  = BUFFER_COUNT;
-	req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	req.memory = V4L2_MEMORY_MMAP;					// mmap 方式，不是 read 拷贝
-
-	if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0)
-	{
-		perror("VIDIOC_REQBUFS");
-		return 1;
-	}
-
-	printf("[4] 驱动实际分配 %u 块缓冲\n", req.count);	// 内存紧张时可能少给
-
-	if (req.count < 2)
-	{
-		fprintf(stderr, "错误: 缓冲数量不足，至少需要 2 块\n");
-		return 1;
-	}
-
-	struct buffer *buffers = calloc(req.count, sizeof(*buffers));
-	if (buffers == NULL)
-	{
-		perror("calloc");
-		return 1;
-	}
-
-	for (unsigned int i = 0; i < req.count; i++)
-	{
-		struct v4l2_buffer buf;
-		memset(&buf, 0, sizeof(buf));
-
-		buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		buf.memory = V4L2_MEMORY_MMAP;
-		buf.index  = i;								// 问第几块
-
-		if (xioctl(fd, VIDIOC_QUERYBUF, &buf) < 0)
-		{
-			perror("VIDIOC_QUERYBUF");
-			return 1;
-		}
-
-		buffers[i].length = buf.length;
-
-		// MAP_SHARED：和驱动共享同一块物理内存，驱动写进来我能看见
-		// buf.m.offset：这块缓冲在设备内存里的偏移，只有驱动知道
-		buffers[i].start = mmap(NULL, buf.length,
-								PROT_READ | PROT_WRITE,
-								MAP_SHARED, fd, buf.m.offset);
-
-		if (buffers[i].start == MAP_FAILED)
-		{
-			perror("mmap");
-			return 1;
-		}
-
-		// 空缓冲交给驱动，不入队的话 STREAMON 会因为没缓冲可用直接失败
-		if (xioctl(fd, VIDIOC_QBUF, &buf) < 0)
-		{
-			perror("VIDIOC_QBUF");
-			return 1;
-		}
-
-		printf("    缓冲 %u: 长度 %u 字节\n", i, buf.length);
-	}
-
-	printf("[4] %u 块缓冲已映射并入队\n", req.count);
-
-	// ---------- [5] 开流 ----------
-
-	enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-
-	if (xioctl(fd, VIDIOC_STREAMON, &type) < 0)
-	{
-		perror("VIDIOC_STREAMON");
-		return 1;
-	}
-	printf("[5] 已开流，驱动开始采集\n");
-
-	// 开流之后再读一次，看 UVC 带宽协商有没有偷偷改帧率
-	memset(&parm, 0, sizeof(parm));
-	parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	if (xioctl(fd, VIDIOC_G_PARM, &parm) == 0)
-	{
-		printf("[5.5] 开流后帧率: %u/%u\n",
-			   parm.parm.capture.timeperframe.numerator,
-			   parm.parm.capture.timeperframe.denominator);
-	}
 	ring_init(&g_ring_net);
 	ring_init(&g_ring_prev);
 
@@ -345,14 +430,14 @@ int main(int argc, char **argv)
 	{
 		fd_set fds;
 		FD_ZERO(&fds);
-		FD_SET(fd, &fds);
+		FD_SET(g_fd, &fds);
 
 		struct timeval tv;
 		tv.tv_sec  = 5;								// 2 秒不够，摄像头要初始化自动曝光
 		tv.tv_usec = 0;
 
 		// 非阻塞模式下 DQBUF 没数据会立即返回 EAGAIN，用 select 睡着等更省 CPU
-		int r = select(fd + 1, &fds, NULL, NULL, &tv);
+		int r = select(g_fd + 1, &fds, NULL, NULL, &tv);
 
 		if (r < 0)
 		{
@@ -361,8 +446,10 @@ int main(int argc, char **argv)
 		}
 		if (r == 0)
 		{
-			fprintf(stderr, "等待超时: 5 秒内没有拿到帧\n");
-			break;
+			fprintf(stderr, "等待超时: 5 秒内没有拿到帧，摄像头可能掉了\n");
+			if (cam_reopen(dev_name, pixfmt, want_w, want_h) < 0)
+				break;
+			continue;
 		}
 
 		struct v4l2_buffer buf;
@@ -370,16 +457,18 @@ int main(int argc, char **argv)
 		buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 		buf.memory = V4L2_MEMORY_MMAP;
 
-		if (xioctl(fd, VIDIOC_DQBUF, &buf) < 0)
+		if (xioctl(g_fd, VIDIOC_DQBUF, &buf) < 0)
 		{
 			perror("VIDIOC_DQBUF");
-			break;
+			if (cam_reopen(dev_name, pixfmt, want_w, want_h) < 0)
+				break;
+			continue;
 		}
 
 		// bytesused 是这一帧的有效字节数，比缓冲总长度小得多
 		// 两路消费者各一条队列，复制两份，谁慢谁丢自己的
-		ring_put(&g_ring_net,  buffers[buf.index].start, buf.bytesused);
-		ring_put(&g_ring_prev, buffers[buf.index].start, buf.bytesused);
+		ring_put(&g_ring_net,  g_buffers[buf.index].start, buf.bytesused);
+		ring_put(&g_ring_prev, g_buffers[buf.index].start, buf.bytesused);
 
 		win_frames++;
 		clock_gettime(CLOCK_MONOTONIC, &win_now);
@@ -402,7 +491,7 @@ int main(int argc, char **argv)
 		printf("[6] 取到第 %d 帧, 入队 seq=%lu\n", n, g_ring_net.put_cnt - 1);
 
 		// 用完必须还回去，不还的话缓冲用一块少一块，第 4 帧之后就取不到数据
-		if (xioctl(fd, VIDIOC_QBUF, &buf) < 0)
+		if (xioctl(g_fd, VIDIOC_QBUF, &buf) < 0)
 		{
 			perror("VIDIOC_QBUF 归还");
 			break;
@@ -431,15 +520,7 @@ int main(int argc, char **argv)
 
 	// ---------- [7] 收尾清理 ----------
 
-	xioctl(fd, VIDIOC_STREAMOFF, &type);
-
-	for (unsigned int i = 0; i < req.count; i++)
-	{
-		munmap(buffers[i].start, buffers[i].length);	// 长度必须和 mmap 时一致
-	}
-	free(buffers);
-
-	close(fd);
+	cam_close();
 
 	printf("[7] 已清理，正常退出\n");
 	return 0;
