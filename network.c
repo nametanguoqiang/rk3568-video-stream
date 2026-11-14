@@ -95,15 +95,36 @@ static int send_response(int fd, const char *ctype, const char *body, int blen)
 
 	return 0;
 }
+// 读自己进程的常驻内存，单位 KB。压测时靠它看长时间运行有没有泄漏
+static long read_rss_kb(void)
+{
+	FILE *fp = fopen("/proc/self/statm", "r");
+	if (fp == NULL)
+		return -1;
+
+	long total = 0;
+	long rss   = 0;
+
+	if (fscanf(fp, "%ld %ld", &total, &rss) != 2)
+	{
+		fclose(fp);
+		return -1;
+	}
+	fclose(fp);
+
+	// statm 的单位是页，页大小一般是 4KB
+	return rss * (sysconf(_SC_PAGESIZE) / 1024);
+}
+
 // /status 返回 JSON，浏览器用 JS 解析显示
 static int handle_status(int fd)
 {
 	char body[256];
 	int n = snprintf(body, sizeof(body),
 			 "{\"fps\":%.1f,\"frames\":%lu,\"drop_stream\":%lu,"
-			 "\"drop_preview\":%lu,\"clients\":%d,\"uptime\":%ld}\n",
+			 "\"drop_preview\":%lu,\"clients\":%d,\"uptime\":%ld,\"rss\":%ld}\n",
 			 g_fps, g_frames, g_drop_net, g_drop_prev,
-			 g_clicnt, (long)(time(NULL) - g_start));
+			 g_clicnt, (long)(time(NULL) - g_start), read_rss_kb());
 
 	return send_response(fd, "application/json", body, n);
 }
